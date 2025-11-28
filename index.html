@@ -9,8 +9,16 @@
 </head>
 <body>
 
+    <!-- SERVER URL MODAL (New) -->
+    <div id="server-modal" style="display:flex; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #222; z-index: 10000; align-items: center; justify-content: center; flex-direction: column;">
+        <h2 style="color:white; font-family: sans-serif;">Connect to Server</h2>
+        <p style="color:#aaa; font-family: sans-serif; margin-bottom: 20px;">Enter the Ngrok HTTPS URL</p>
+        <input type="text" id="server-url-input" placeholder="https://xxxx.ngrok-free.app" style="padding: 10px; width: 300px; border-radius: 5px; border:none;">
+        <button onclick="saveServerAndReload()" style="margin-top: 15px; background: #30d158; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer;">Connect</button>
+    </div>
+
     <!-- WELCOME MODAL -->
-    <div id="welcome-modal">
+    <div id="welcome-modal" style="display:none;"> <!-- Hidden initially -->
         <div class="modal-content">
             <h2>Join Meeting</h2>
             <p>High-Fidelity Audio & Collaboration</p>
@@ -30,7 +38,7 @@
     
     <div id="notification-area"></div>
     
-    <!-- VIDEO LAYER (Screen Share) -->
+    <!-- VIDEO LAYER -->
     <div id="video-layer">
         <div class="video-header">
             <span><ion-icon name="radio-button-on" style="color:#ff453a"></ion-icon> Live Screen Share</span>
@@ -76,15 +84,47 @@
     </div>
 
     <canvas id="canvas"></canvas>
-
-    <!-- HIDDEN AUDIO CONTAINER -->
     <div id="audio-container" style="display:none; pointer-events: none;"></div>
 
-    <script src="/socket.io/socket.io.js"></script>        
+    <!-- UPDATE 1: Load Socket.io from CDN -->
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>        
     <script>
-        const socket = io({ transports: ['websocket'] }); // Force websocket for speed
+        // --- CONNECTION SETUP FOR VERCEL + NGROK ---
+        let socket;
+        const storedUrl = localStorage.getItem('ngrok_url');
+
+        function saveServerAndReload() {
+            const url = document.getElementById('server-url-input').value.trim();
+            if(url) {
+                localStorage.setItem('ngrok_url', url);
+                location.reload();
+            }
+        }
+
+        if (!storedUrl) {
+            // No URL found, show input modal
+            document.getElementById('server-modal').style.display = 'flex';
+        } else {
+            // URL found, hide server modal, show welcome modal, connect
+            document.getElementById('server-modal').style.display = 'none';
+            document.getElementById('welcome-modal').style.display = 'flex';
+            
+            // Connect to the Ngrok URL
+            try {
+                socket = io(storedUrl, { 
+                    transports: ['websocket', 'polling'], // Allow polling fallbacks for ngrok
+                    secure: true 
+                });
+            } catch(e) {
+                alert("Invalid URL. Resetting.");
+                localStorage.removeItem('ngrok_url');
+                location.reload();
+            }
+        }
+
+        // --- ORIGINAL APP CODE ---
         const canvas = document.getElementById('canvas');
-        const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true }); // Optimized context
+        const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
         const statusEl = document.getElementById('connection-status');
         const countEl = document.getElementById('user-count-val');
         const notificationArea = document.getElementById('notification-area');
@@ -98,7 +138,6 @@
         const shareBtn = document.getElementById('btnShare');
         const audioContainer = document.getElementById('audio-container');
 
-        // --- PRODUCTION STATE ---
         let items = [];
         let camera = { x: 0, y: 0, zoom: 1 };
         let isDragging = false, mode = 'pen';
@@ -106,37 +145,33 @@
         let bgColor = '#222222';
         let remoteCursors = {}, selectedItems = [], isMarquee = false, isResizing = false;
         let drawBuffer = [], cursorLastEmit = 0, updateEmitThrottle = 0;
-        
-        // Audio/Video
         let localStream = null, localScreenStream = null;
         let audioPeers = {}, screenPeers = {}; 
         let isMuted = true, isSharingScreen = false;
-        let iceCandidatesQueue = {}; // Buffer for WebRTC race conditions
+        let iceCandidatesQueue = {}; 
 
         const generateId = () => Math.random().toString(36).substr(2, 9);
         const R = (n) => Math.round(n * 100) / 100;
 
-        // --- INITIALIZATION ---
         function resize() {
             canvas.width = window.innerWidth;
             canvas.height = window.innerHeight;
             minimapCanvas.width = 200; minimapCanvas.height = 150;
-            // Force redraw immediately
             renderLoop(); 
         }
         window.addEventListener('resize', resize);
         window.addEventListener('orientationchange', () => setTimeout(resize, 200));
         resize();
 
-        // High-Performance Rendering Loop (Decouples Network from 60FPS)
         function renderLoop() {
             redraw();
             requestAnimationFrame(renderLoop);
         }
-        requestAnimationFrame(renderLoop); // Start loop
+        requestAnimationFrame(renderLoop); 
 
         // 1. ENTRY LOGIC
         async function enterRoom() {
+            if(!socket) return alert("Server connection missing");
             const input = document.getElementById('username-input');
             const btn = document.getElementById('join-btn');
             if(!input.value.trim()) return alert("Please enter a name");
@@ -145,273 +180,135 @@
             btn.disabled = true;
 
             try {
-                // PROFESSIONAL AUDIO CONSTRAINTS
                 localStream = await navigator.mediaDevices.getUserMedia({ 
                     video: false, 
-                    audio: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true,
-                        highpassFilter: true,
-                        channelCount: 1, // Mono is better for voice bandwidth
-                        sampleRate: 48000
-                    }
+                    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
                 });
-                
-                // Mute local playback to prevent echo
                 localStream.getAudioTracks()[0].enabled = false;
                 isMuted = true;
                 micBtn.classList.add('muted');
                 
                 document.getElementById('welcome-modal').style.display = 'none';
                 socket.emit('join-room', input.value.trim());
-
             } catch (err) {
                 console.error("Mic Error:", err);
-                alert("Microphone Access Denied. You can draw, but voice chat will be disabled. Check HTTPS/Permissions.");
+                alert("Microphone Access Denied. Chat disabled.");
                 document.getElementById('welcome-modal').style.display = 'none';
                 socket.emit('join-room', input.value.trim());
             }
         }
 
-        // --- SOCKET HANDLERS ---
-        socket.on('init', (data) => {
-            items = data.history;
-            statusEl.innerText = "Connected"; statusEl.classList.add('visible', 'connected');
-            setTimeout(() => statusEl.classList.remove('visible'), 2000);
-        });
-
-        socket.on('user-count', count => countEl.innerText = count);
-        socket.on('user-notification', data => showNotification(data));
-
-        // --- AUDIO MESH NETWORK ---
-        socket.on('all-users', users => {
-            users.forEach(id => createPeer(id, socket.id, true));
-        });
-
-        socket.on('user-joined-audio', p => {
-            createPeer(p.callerID, socket.id, false, p.signal);
-        });
-
-        socket.on('receiving-returned-signal', p => {
-            const item = audioPeers[p.id];
-            if(item) item.signal(p.signal);
-        });
-
-        socket.on('ice-candidate', p => {
-            const item = audioPeers[p.sender];
-            if(item) item.addIce(p.candidate);
-        });
-
-        socket.on('user-disconnected', id => { 
-            if(audioPeers[id]) { audioPeers[id].destroy(); delete audioPeers[id]; }
-            if(remoteCursors[id]) { remoteCursors[id].remove(); delete remoteCursors[id]; }
-            if(screenPeers[id]) { screenPeers[id].close(); delete screenPeers[id]; }
-            const el = document.getElementById(`audio-${id}`);
-            if(el) el.remove();
-        });
-
-        // --- PEER CONNECTION FACTORY ---
-        function createPeer(targetId, myId, initiator, incomingSignal = null) {
-            const peer = new RTCPeerConnection({
-                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        // --- SOCKET LOGIC WRAPPER (Runs only if socket exists) ---
+        if(storedUrl) {
+            socket.on('connect_error', (err) => {
+                console.log("Connect Error", err);
+                statusEl.innerText = "Error Connecting";
+                statusEl.style.background = "orange";
+                statusEl.classList.add('visible');
             });
 
-            audioPeers[targetId] = {
-                pc: peer,
-                destroy: () => peer.close(),
-                signal: (sdp) => peer.setRemoteDescription(new RTCSessionDescription(sdp)),
-                addIce: (candidate) => {
-                    // Buffering ICE candidates to avoid race conditions
-                    if (peer.remoteDescription) peer.addIceCandidate(new RTCIceCandidate(candidate));
-                    else (iceCandidatesQueue[targetId] = iceCandidatesQueue[targetId] || []).push(candidate);
-                }
-            };
+            socket.on('init', (data) => {
+                items = data.history;
+                statusEl.innerText = "Connected"; statusEl.classList.add('visible', 'connected');
+                setTimeout(() => statusEl.classList.remove('visible'), 2000);
+            });
 
-            if(localStream) {
-                localStream.getTracks().forEach(t => peer.addTrack(t, localStream));
-            }
+            socket.on('user-count', count => countEl.innerText = count);
+            socket.on('user-notification', data => showNotification(data));
+            socket.on('all-users', users => users.forEach(id => createPeer(id, socket.id, true)));
+            socket.on('user-joined-audio', p => createPeer(p.callerID, socket.id, false, p.signal));
+            socket.on('receiving-returned-signal', p => { if(audioPeers[p.id]) audioPeers[p.id].signal(p.signal); });
+            socket.on('ice-candidate', p => { if(audioPeers[p.sender]) audioPeers[p.sender].addIce(p.candidate); });
+            socket.on('user-disconnected', id => { 
+                if(audioPeers[id]) { audioPeers[id].destroy(); delete audioPeers[id]; }
+                if(remoteCursors[id]) { remoteCursors[id].remove(); delete remoteCursors[id]; }
+                if(screenPeers[id]) { screenPeers[id].close(); delete screenPeers[id]; }
+                const el = document.getElementById(`audio-${id}`); if(el) el.remove();
+            });
 
-            peer.onicecandidate = e => {
-                if(e.candidate) socket.emit('ice-candidate', { target: targetId, candidate: e.candidate });
-            };
+            setInterval(() => { if (drawBuffer.length > 0) { socket.emit('draw_batch', drawBuffer); drawBuffer = []; } }, 30);
 
-            peer.ontrack = e => {
-                let audio = document.getElementById(`audio-${targetId}`);
-                if (!audio) {
-                    audio = document.createElement('audio');
-                    audio.id = `audio-${targetId}`;
-                    audio.autoplay = true;
-                    audio.playsInline = true;
-                    audioContainer.appendChild(audio);
-                }
-                audio.srcObject = e.streams[0];
-            };
+            socket.on('draw_batch', b => items.push(...b));
+            socket.on('update_batch', u => { u.forEach(x => { const i = items.findIndex(k => k.id===x.id); if(i!==-1) items[i]=x; }); });
+            socket.on('delete_batch', d => { items = items.filter(i => !d.includes(i.id)); selectedItems=[]; });
+            socket.on('sync_history', h => { items = h; selectedItems=[]; });
+            socket.on('clear', () => { items=[]; selectedItems=[]; });
+            socket.on('cursor', d => {
+                let c = remoteCursors[d.id];
+                if(!c) { c = document.createElement('div'); c.className='remote-cursor'; c.innerHTML=`<div class="cursor-arrow" style="color:${d.color}"></div>`; document.getElementById('cursor-layer').appendChild(c); remoteCursors[d.id]=c; }
+                c.dataset.wx=d.x; c.dataset.wy=d.y; updateCursorScreenPos(c);
+            });
 
-            if (initiator) {
-                peer.createOffer()
-                    .then(sdp => peer.setLocalDescription(sdp))
-                    .then(() => socket.emit('sending-signal', { userToSignal: targetId, callerID: myId, signal: peer.localDescription }));
-            } else {
-                peer.setRemoteDescription(new RTCSessionDescription(incomingSignal))
-                    .then(() => {
-                        // Process buffered ICE candidates
-                        if (iceCandidatesQueue[targetId]) {
-                            iceCandidatesQueue[targetId].forEach(c => peer.addIceCandidate(new RTCIceCandidate(c)));
-                            delete iceCandidatesQueue[targetId];
-                        }
-                        return peer.createAnswer();
-                    })
-                    .then(sdp => peer.setLocalDescription(sdp))
-                    .then(() => socket.emit('returning-signal', { signal: peer.localDescription, callerID: targetId }));
-            }
+            socket.on('screen-share-started', (id) => { if(id!==socket.id){ videoLayer.style.display='flex'; showNotification({text:"Screen Share Started", type:'join'}); } });
+            socket.on('screen-share-stopped', () => { videoLayer.style.display='none'; remoteVideo.srcObject=null; showNotification({text:"Screen Share Ended", type:'leave'}); });
+            socket.on('screen-share-active', () => videoLayer.style.display='flex');
+            socket.on('screen-signal', async d => {
+                 if(d.sender===socket.id) return;
+                 if(!screenPeers[d.sender]){
+                     const p = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]}); 
+                     screenPeers[d.sender]=p;
+                     p.ontrack = e => remoteVideo.srcObject = e.streams[0];
+                     p.onicecandidate = e => { if(e.candidate) socket.emit('screen-signal', { target: d.sender, signal: { candidate: e.candidate } }); };
+                 }
+                 const p = screenPeers[d.sender];
+                 if(d.signal.sdp){ await p.setRemoteDescription(d.signal.sdp); if(d.signal.sdp.type==='offer'){ await p.setLocalDescription(await p.createAnswer()); socket.emit('screen-signal',{target:d.sender,signal:{sdp:p.localDescription}}); } } else if(d.signal.candidate) p.addIceCandidate(new RTCIceCandidate(d.signal.candidate));
+            });
         }
 
-        // --- DATA SYNC ---
-        // Throttled batch sender (30ms) to prevent network flooding
-        setInterval(() => { 
-            if (drawBuffer.length > 0) { 
-                socket.emit('draw_batch', drawBuffer); 
-                drawBuffer = []; 
-            } 
-        }, 30);
-
-        socket.on('draw_batch', b => items.push(...b)); // Render loop handles drawing
-        socket.on('update_batch', u => { u.forEach(x => { const i = items.findIndex(k => k.id===x.id); if(i!==-1) items[i]=x; }); });
-        socket.on('delete_batch', d => { items = items.filter(i => !d.includes(i.id)); selectedItems=[]; });
-        socket.on('sync_history', h => { items = h; selectedItems=[]; });
-        socket.on('clear', () => { items=[]; selectedItems=[]; });
-        socket.on('cursor', d => {
-            let c = remoteCursors[d.id];
-            if(!c) { 
-                c = document.createElement('div'); c.className='remote-cursor'; 
-                c.innerHTML=`<div class="cursor-arrow" style="color:${d.color}"></div>`; 
-                document.getElementById('cursor-layer').appendChild(c); 
-                remoteCursors[d.id]=c; 
-            }
-            // Interpolation target could be added here for even smoother cursors
-            c.dataset.wx=d.x; c.dataset.wy=d.y; updateCursorScreenPos(c);
-        });
-
-        // --- SCREEN SHARE ---
-        socket.on('screen-share-started', (id) => { 
-            if(id!==socket.id){ videoLayer.style.display='flex'; showNotification({text:"Screen Share Started", type:'join'}); } 
-        });
-        socket.on('screen-share-stopped', () => { 
-            videoLayer.style.display='none'; remoteVideo.srcObject=null; showNotification({text:"Screen Share Ended", type:'leave'}); 
-        });
-        socket.on('screen-share-active', () => videoLayer.style.display='flex');
-
-        socket.on('screen-signal', async d => {
-             if(d.sender===socket.id) return;
-             // Simple one-way negotiation
-             if(!screenPeers[d.sender]){
-                 const p = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]}); 
-                 screenPeers[d.sender]=p;
-                 p.ontrack = e => remoteVideo.srcObject = e.streams[0];
-                 p.onicecandidate = e => { if(e.candidate) socket.emit('screen-signal', { target: d.sender, signal: { candidate: e.candidate } }); };
-             }
-             const p = screenPeers[d.sender];
-             if(d.signal.sdp){ 
-                 await p.setRemoteDescription(d.signal.sdp); 
-                 if(d.signal.sdp.type==='offer'){ 
-                     await p.setLocalDescription(await p.createAnswer()); 
-                     socket.emit('screen-signal',{target:d.sender,signal:{sdp:p.localDescription}}); 
-                 }
-             } else if(d.signal.candidate) p.addIceCandidate(new RTCIceCandidate(d.signal.candidate));
-        });
+        // --- REMAINING HELPER FUNCTIONS (No Changes needed below here from your original code) ---
+        function createPeer(targetId, myId, initiator, incomingSignal = null) {
+            const peer = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+            audioPeers[targetId] = {
+                pc: peer, destroy: () => peer.close(), signal: (sdp) => peer.setRemoteDescription(new RTCSessionDescription(sdp)),
+                addIce: (candidate) => { if (peer.remoteDescription) peer.addIceCandidate(new RTCIceCandidate(candidate)); else (iceCandidatesQueue[targetId] = iceCandidatesQueue[targetId] || []).push(candidate); }
+            };
+            if(localStream) localStream.getTracks().forEach(t => peer.addTrack(t, localStream));
+            peer.onicecandidate = e => { if(e.candidate) socket.emit('ice-candidate', { target: targetId, candidate: e.candidate }); };
+            peer.ontrack = e => {
+                let audio = document.getElementById(`audio-${targetId}`);
+                if (!audio) { audio = document.createElement('audio'); audio.id = `audio-${targetId}`; audio.autoplay = true; audio.playsInline = true; audioContainer.appendChild(audio); }
+                audio.srcObject = e.streams[0];
+            };
+            if (initiator) { peer.createOffer().then(sdp => peer.setLocalDescription(sdp)).then(() => socket.emit('sending-signal', { userToSignal: targetId, callerID: myId, signal: peer.localDescription }));
+            } else { peer.setRemoteDescription(new RTCSessionDescription(incomingSignal)).then(() => { if (iceCandidatesQueue[targetId]) { iceCandidatesQueue[targetId].forEach(c => peer.addIceCandidate(new RTCIceCandidate(c))); delete iceCandidatesQueue[targetId]; } return peer.createAnswer(); }).then(sdp => peer.setLocalDescription(sdp)).then(() => socket.emit('returning-signal', { signal: peer.localDescription, callerID: targetId })); }
+        }
 
         async function toggleScreenShare() {
             if(isSharingScreen) { stopScreenShare(); return; }
             try {
-                // High FPS screen share
                 const stream = await navigator.mediaDevices.getDisplayMedia({video:{frameRate: 30}, audio: false});
                 localScreenStream = stream; isSharingScreen = true; shareBtn.classList.add('active'); shareBtn.style.color = '#30d158';
                 socket.emit('start-screen-share');
-                
                 stream.getVideoTracks()[0].onended = stopScreenShare;
-
-                // Broadcast to all audio peers
                 Object.keys(audioPeers).forEach(uid => {
                    const p = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
-                   screenPeers[uid] = p; 
-                   stream.getTracks().forEach(t => p.addTrack(t, stream));
+                   screenPeers[uid] = p; stream.getTracks().forEach(t => p.addTrack(t, stream));
                    p.onicecandidate = e => { if(e.candidate) socket.emit('screen-signal', { target: uid, signal: { candidate: e.candidate } }); };
                    p.createOffer().then(sdp => p.setLocalDescription(sdp)).then(() => socket.emit('screen-signal', { target: uid, signal: { sdp: p.localDescription } }));
                 });
             } catch(e) { console.error(e); showNotification({text: "Share Cancelled", type:'leave'}); }
         }
-
-        function stopScreenShare(){ 
-            isSharingScreen=false; 
-            if(localScreenStream) localScreenStream.getTracks().forEach(t=>t.stop()); 
-            shareBtn.classList.remove('active'); shareBtn.style.color=''; 
-            socket.emit('stop-screen-share'); 
-            Object.values(screenPeers).forEach(p=>p.close()); screenPeers={}; 
-        }
-
-        // --- HELPERS & LOGIC ---
-        function toggleMic() {
-            if (!localStream) return showNotification({text:"No Mic Found", type:'leave'});
-            isMuted = !isMuted;
-            localStream.getAudioTracks()[0].enabled = !isMuted;
-            if (isMuted) {
-                micBtn.classList.remove('active-mic'); micBtn.classList.add('muted'); micIcon.setAttribute('name', 'mic-off-outline');
-                showNotification({text: "Microphone Muted"});
-            } else {
-                micBtn.classList.remove('muted'); micBtn.classList.add('active-mic'); micIcon.setAttribute('name', 'mic-outline');
-                showNotification({text: "Microphone Active"});
-            }
-        }
-
+        function stopScreenShare(){ isSharingScreen=false; if(localScreenStream) localScreenStream.getTracks().forEach(t=>t.stop()); shareBtn.classList.remove('active'); shareBtn.style.color=''; socket.emit('stop-screen-share'); Object.values(screenPeers).forEach(p=>p.close()); screenPeers={}; }
+        function toggleMic() { if (!localStream) return showNotification({text:"No Mic Found", type:'leave'}); isMuted = !isMuted; localStream.getAudioTracks()[0].enabled = !isMuted; if (isMuted) { micBtn.classList.remove('active-mic'); micBtn.classList.add('muted'); micIcon.setAttribute('name', 'mic-off-outline'); showNotification({text: "Microphone Muted"}); } else { micBtn.classList.remove('muted'); micBtn.classList.add('active-mic'); micIcon.setAttribute('name', 'mic-outline'); showNotification({text: "Microphone Active"}); } }
         function redraw() {
-            ctx.setTransform(1, 0, 0, 1, 0, 0); 
-            ctx.fillStyle = bgColor; ctx.fillRect(0, 0, canvas.width, canvas.height); 
-            drawGrid();
-            
-            ctx.translate(camera.x, camera.y); 
-            ctx.scale(camera.zoom, camera.zoom); 
-            ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-
+            ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = bgColor; ctx.fillRect(0, 0, canvas.width, canvas.height); drawGrid();
+            ctx.translate(camera.x, camera.y); ctx.scale(camera.zoom, camera.zoom); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
             drawMinimap();
-
             for (let item of items) {
-                 ctx.lineWidth = item.size; 
-                 ctx.strokeStyle = item.type === 'eraser' ? bgColor : item.color; 
-                 ctx.fillStyle = item.color; 
-                 ctx.beginPath();
-                 
-                 if (item.type === 'line' || item.type === 'eraser') { 
-                     ctx.moveTo(item.p1.x, item.p1.y); ctx.lineTo(item.p2.x, item.p2.y); ctx.stroke(); 
-                 }
+                 ctx.lineWidth = item.size; ctx.strokeStyle = item.type === 'eraser' ? bgColor : item.color; ctx.fillStyle = item.color; ctx.beginPath();
+                 if (item.type === 'line' || item.type === 'eraser') { ctx.moveTo(item.p1.x, item.p1.y); ctx.lineTo(item.p2.x, item.p2.y); ctx.stroke(); }
                  else if (item.type === 'rect') { ctx.strokeRect(item.x, item.y, item.w, item.h); }
                  else if (item.type === 'circle') { ctx.arc(item.x, item.y, item.r, 0, Math.PI * 2); ctx.stroke(); }
                  else if (item.type === 'text') { ctx.font = `${item.size * 5}px sans-serif`; ctx.fillText(item.text, item.x, item.y); }
             }
-
-            // Current Drawing Preview
             if (isDragging && (mode==='rect'||mode==='circle')) {
-                const w=(currentPos.x-startPos.x)/camera.zoom; const h=(currentPos.y-startPos.y)/camera.zoom;
-                const wx=(startPos.x-camera.x)/camera.zoom; const wy=(startPos.y-camera.y)/camera.zoom;
+                const w=(currentPos.x-startPos.x)/camera.zoom; const h=(currentPos.y-startPos.y)/camera.zoom; const wx=(startPos.x-camera.x)/camera.zoom; const wy=(startPos.y-camera.y)/camera.zoom;
                 ctx.strokeStyle=document.getElementById('penColor').value; ctx.lineWidth=2; ctx.beginPath();
-                if(mode==='rect') ctx.strokeRect(wx, wy, w, h); 
-                else { const r=Math.sqrt(w*w+h*h); ctx.arc(wx,wy,r,0,Math.PI*2); ctx.stroke(); }
+                if(mode==='rect') ctx.strokeRect(wx, wy, w, h); else { const r=Math.sqrt(w*w+h*h); ctx.arc(wx,wy,r,0,Math.PI*2); ctx.stroke(); }
             }
-            if (isMarquee) { 
-                ctx.save(); ctx.setTransform(1,0,0,1,0,0); 
-                ctx.strokeStyle='#0a84ff'; ctx.fillStyle='rgba(10,132,255,0.2)'; ctx.lineWidth=1; 
-                const w=currentPos.x-startPos.x; const h=currentPos.y-startPos.y; 
-                ctx.fillRect(startPos.x,startPos.y,w,h); ctx.strokeRect(startPos.x,startPos.y,w,h); 
-                ctx.restore(); 
-            }
-            if (selectedItems.length > 0) {
-                 ctx.save(); ctx.strokeStyle='#e0ac00'; ctx.lineWidth=1/camera.zoom; ctx.setLineDash([5,5]);
-                 selectedItems.forEach(i => { const b=getBoundingBox(i); if(b) ctx.strokeRect(b.x-5,b.y-5,b.w+10,b.h+10); });
-                 ctx.restore();
-            }
+            if (isMarquee) { ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.strokeStyle='#0a84ff'; ctx.fillStyle='rgba(10,132,255,0.2)'; ctx.lineWidth=1; const w=currentPos.x-startPos.x; const h=currentPos.y-startPos.y; ctx.fillRect(startPos.x,startPos.y,w,h); ctx.strokeRect(startPos.x,startPos.y,w,h); ctx.restore(); }
+            if (selectedItems.length > 0) { ctx.save(); ctx.strokeStyle='#e0ac00'; ctx.lineWidth=1/camera.zoom; ctx.setLineDash([5,5]); selectedItems.forEach(i => { const b=getBoundingBox(i); if(b) ctx.strokeRect(b.x-5,b.y-5,b.w+10,b.h+10); }); ctx.restore(); }
         }
-
-        // --- UTILS (Minified logic for clean code) ---
         function drawMinimap() { minimapCtx.fillStyle = '#000'; minimapCtx.fillRect(0,0,minimapCanvas.width,minimapCanvas.height); if(items.length===0) return; let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity; for(let i=0; i<items.length; i+=5) { const it=items[i]; if(it.type==='line'||it.type==='eraser') { if(it.p1.x<minX)minX=it.p1.x; if(it.p1.x>maxX)maxX=it.p1.x; if(it.p1.y<minY)minY=it.p1.y; if(it.p1.y>maxY)maxY=it.p1.y; } else { if(it.x<minX)minX=it.x; if(it.x>maxX)maxX=it.x; if(it.y<minY)minY=it.y; if(it.y>maxY)maxY=it.y; } } if(minX===Infinity) return; const pad=500; minX-=pad; minY-=pad; maxX+=pad; maxY+=pad; const scale = Math.min(minimapCanvas.width/(maxX-minX), minimapCanvas.height/(maxY-minY)); minimapCtx.save(); minimapCtx.translate((minimapCanvas.width-(maxX-minX)*scale)/2, (minimapCanvas.height-(maxY-minY)*scale)/2); minimapCtx.scale(scale, scale); minimapCtx.translate(-minX, -minY); minimapCtx.beginPath(); items.forEach(it => { if(it.type==='line') { minimapCtx.moveTo(it.p1.x,it.p1.y); minimapCtx.lineTo(it.p2.x,it.p2.y); } }); minimapCtx.strokeStyle='#666'; minimapCtx.lineWidth=20; minimapCtx.stroke(); const tl = toWorld(0,0); const br = toWorld(canvas.width,canvas.height); minimapCtx.strokeStyle='#ff3b30'; minimapCtx.lineWidth=20/scale; minimapCtx.strokeRect(tl.x,tl.y,br.x-tl.x,br.y-tl.y); minimapCtx.restore(); }
         function getBoundingBox(i) { if(i.type==='rect')return{x:i.x,y:i.y,w:i.w,h:i.h}; if(i.type==='circle')return{x:i.x-i.r,y:i.y-i.r,w:i.r*2,h:i.r*2}; if(i.type==='text')return{x:i.x,y:i.y-(i.size*5),w:i.text.length*(i.size*3),h:i.size*5}; if(i.type==='line'||i.type==='eraser'){const x=Math.min(i.p1.x,i.p2.x),y=Math.min(i.p1.y,i.p2.y);return{x,y,w:Math.abs(i.p1.x-i.p2.x)||5,h:Math.abs(i.p1.y-i.p2.y)||5};} return null; }
         function isPointInItem(wx, wy, i) { const b=getBoundingBox(i); if(!b)return false; return wx>=b.x-10 && wx<=b.x+b.w+10 && wy>=b.y-10 && wy<=b.y+b.h+10; }
@@ -424,7 +321,7 @@
         function deleteSelectionOrClear(){ if(selectedItems.length>0){ const ids=selectedItems.map(i=>i.id); socket.emit('delete_batch',ids); items=items.filter(i=>!ids.includes(i.id)); selectedItems=[]; }else{ socket.emit('clear'); } }
         function getXY(e){ return {x:e.touches?e.touches[0].clientX:e.clientX, y:e.touches?e.touches[0].clientY:e.clientY}; }
         function start(e) { if(document.getElementById('welcome-modal').style.display !== 'none') return; const pos = getXY(e); if(mode==='text' && !isDragging) { createTextInput(pos.x,pos.y); return; } if(mode==='select') { const wPos=toWorld(pos.x,pos.y); if(selectedItems.length===1 && !['line','eraser'].includes(selectedItems[0].type)) { const b=getBoundingBox(selectedItems[0]); if(Math.abs(wPos.x-(b.x+b.w))<20/camera.zoom && Math.abs(wPos.y-(b.y+b.h))<20/camera.zoom) { isResizing=true; isDragging=true; startPos=wPos; return; } } let clickedOnSel=false; for(let i of selectedItems) if(isPointInItem(wPos.x,wPos.y,i)){clickedOnSel=true;break;} if(clickedOnSel){ isDragging=true; isMarquee=false; isResizing=false; lastPos=pos; return; } let clicked=null; for(let i=items.length-1;i>=0;i--) if(isPointInItem(wPos.x,wPos.y,items[i])){clicked=items[i];break;} if(clicked){ selectedItems=[clicked]; isDragging=true; isMarquee=false; isResizing=false; lastPos=pos; } else { isDragging=true; isMarquee=true; selectedItems=[]; startPos=pos; } return; } isDragging=true; startPos=pos; currentPos=pos; lastPos=pos; }
-        function move(e) { const pos=getXY(e); currentPos=pos; if(Date.now()-cursorLastEmit>40){socket.emit('cursor',toWorld(pos.x,pos.y));cursorLastEmit=Date.now();} if(!isDragging)return; if(e.cancelable)e.preventDefault(); const wPos=toWorld(pos.x,pos.y); if(mode==='select'){ if(isMarquee){ } else if(isResizing && selectedItems.length===1){ const i=selectedItems[0]; if(i.type==='rect'){i.w=wPos.x-i.x;i.h=wPos.y-i.y;}else if(i.type==='circle'){const dx=wPos.x-i.x;const dy=wPos.y-i.y;i.r=Math.sqrt(dx*dx+dy*dy);} if(Date.now()-updateEmitThrottle>30){socket.emit('update_batch',[i]);updateEmitThrottle=Date.now();} } else if(selectedItems.length>0){ const dx=(pos.x-lastPos.x)/camera.zoom; const dy=(pos.y-lastPos.y)/camera.zoom; selectedItems.forEach(i=>{if(i.type==='line'||i.type==='eraser'){i.p1.x+=dx;i.p1.y+=dy;i.p2.x+=dx;i.p2.y+=dy;}else{i.x+=dx;i.y+=dy;}}); if(Date.now()-updateEmitThrottle>30){socket.emit('update_batch',selectedItems);updateEmitThrottle=Date.now();} } lastPos=pos; return; } const dx=pos.x-lastPos.x; const dy=pos.y-lastPos.y; if(mode==='hand'||e.buttons===4){ camera.x+=dx; camera.y+=dy; Object.values(remoteCursors).forEach(updateCursorScreenPos); } else if(mode==='pen'||mode==='eraser'){ const p1=toWorld(lastPos.x,lastPos.y); const p2=toWorld(pos.x,pos.y); const color=document.getElementById('penColor').value; const size=mode==='eraser'?50:4; const i={id:generateId(),type:mode==='eraser'?'eraser':'line',p1,p2,color,size}; items.push(i); drawBuffer.push(i); } lastPos=pos; }
+        function move(e) { const pos=getXY(e); currentPos=pos; if(Date.now()-cursorLastEmit>40 && socket){socket.emit('cursor',toWorld(pos.x,pos.y));cursorLastEmit=Date.now();} if(!isDragging)return; if(e.cancelable)e.preventDefault(); const wPos=toWorld(pos.x,pos.y); if(mode==='select'){ if(isMarquee){ } else if(isResizing && selectedItems.length===1){ const i=selectedItems[0]; if(i.type==='rect'){i.w=wPos.x-i.x;i.h=wPos.y-i.y;}else if(i.type==='circle'){const dx=wPos.x-i.x;const dy=wPos.y-i.y;i.r=Math.sqrt(dx*dx+dy*dy);} if(Date.now()-updateEmitThrottle>30){socket.emit('update_batch',[i]);updateEmitThrottle=Date.now();} } else if(selectedItems.length>0){ const dx=(pos.x-lastPos.x)/camera.zoom; const dy=(pos.y-lastPos.y)/camera.zoom; selectedItems.forEach(i=>{if(i.type==='line'||i.type==='eraser'){i.p1.x+=dx;i.p1.y+=dy;i.p2.x+=dx;i.p2.y+=dy;}else{i.x+=dx;i.y+=dy;}}); if(Date.now()-updateEmitThrottle>30){socket.emit('update_batch',selectedItems);updateEmitThrottle=Date.now();} } lastPos=pos; return; } const dx=pos.x-lastPos.x; const dy=pos.y-lastPos.y; if(mode==='hand'||e.buttons===4){ camera.x+=dx; camera.y+=dy; Object.values(remoteCursors).forEach(updateCursorScreenPos); } else if(mode==='pen'||mode==='eraser'){ const p1=toWorld(lastPos.x,lastPos.y); const p2=toWorld(pos.x,pos.y); const color=document.getElementById('penColor').value; const size=mode==='eraser'?50:4; const i={id:generateId(),type:mode==='eraser'?'eraser':'line',p1,p2,color,size}; items.push(i); drawBuffer.push(i); } lastPos=pos; }
         function end() { if(!isDragging)return; isDragging=false; if(mode==='select'){ if(isMarquee){ const startW=toWorld(startPos.x,startPos.y); const currW=toWorld(currentPos.x,currentPos.y); const mx=Math.min(startW.x,currW.x), my=Math.min(startW.y,currW.y), mw=Math.abs(currW.x-startW.x), mh=Math.abs(currW.y-startW.y); selectedItems=items.filter(i=>isItemInMarquee(i,mx,my,mw,mh)); isMarquee=false; } else if(selectedItems.length>0) { socket.emit('update_batch',selectedItems); } } if(mode==='rect'||mode==='circle'){ const w=(currentPos.x-startPos.x)/camera.zoom; const h=(currentPos.y-startPos.y)/camera.zoom; const wx=(startPos.x-camera.x)/camera.zoom; const wy=(startPos.y-camera.y)/camera.zoom; const color=document.getElementById('penColor').value; if(Math.abs(w)<5 && Math.abs(h)<5)return; let i; if(mode==='rect')i={id:generateId(),type:'rect',x:R(wx),y:R(wy),w:R(w),h:R(h),color,size:2}; else{const r=Math.sqrt(w*w+h*h);i={id:generateId(),type:'circle',x:R(wx),y:R(wy),r:R(r),color,size:2};} items.push(i); socket.emit('draw_batch',[i]); } }
         function fitContent() { if (items.length === 0) return; let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity; items.forEach(it => { const b = getBoundingBox(it); if(b) { if(b.x < minX) minX = b.x; if(b.y < minY) minY = b.y; if(b.x + b.w > maxX) maxX = b.x + b.w; if(b.y + b.h > maxY) maxY = b.y + b.h; } }); if(minX === Infinity) return; const pad = 100; const w = maxX - minX + (pad * 2); const h = maxY - minY + (pad * 2); const scaleX = canvas.width / w; const scaleY = canvas.height / h; let newZoom = Math.min(scaleX, scaleY); if(newZoom > 2) newZoom = 2; if(newZoom < 0.1) newZoom = 0.1; camera.zoom = newZoom; camera.x = -((minX - pad) * newZoom) + (canvas.width - w * newZoom) / 2; camera.y = -((minY - pad) * newZoom) + (canvas.height - h * newZoom) / 2; showNotification({ text: "Found all drawings", type: 'info' }); }
         function createTextInput(sx, sy) { textArea.style.display='block'; textArea.style.left=sx+'px'; textArea.style.top=sy+'px'; textArea.value=''; textArea.focus(); textArea.onkeydown=e=>{if(e.key==='Enter'&&textArea.value){const w=toWorld(sx,sy);const i={id:generateId(),type:'text',x:w.x,y:w.y,text:textArea.value,color:document.getElementById('penColor').value,size:4};items.push(i);socket.emit('draw_batch',[i]);textArea.style.display='none';}}; textArea.onblur=()=>textArea.style.display='none'; }
@@ -436,156 +333,4 @@
         canvas.addEventListener('wheel', e=>{e.preventDefault();const f=Math.exp(-e.deltaY*0.001);zoom(f-1);},{passive:false});
     </script>
 </body>
-</html>"
-"/* style.css */
-body { margin: 0; overflow: hidden; background: #222; font-family: 'Segoe UI', sans-serif; }
-canvas { display: block; touch-action: none; outline: none; }
-
-/* TOP BAR (Container for status & counter) */
-.top-bar {
-    position: fixed; top: 0; left: 0; width: 100%;
-    display: flex; justify-content: space-between; align-items: flex-start;
-    padding: 10px; box-sizing: border-box; pointer-events: none; z-index: 200;
-}
-
-#connection-status {
-    background: #ff453a; color: white; padding: 5px 10px; border-radius: 20px;
-    font-size: 11px; font-weight: bold; opacity: 0; transition: opacity 0.5s;
-}
-#connection-status.visible { opacity: 1; }
-#connection-status.connected { background: #30d158; }
-
-#user-counter {
-    background: rgba(0,0,0,0.6); color: white; padding: 5px 12px;
-    border-radius: 20px; font-size: 14px; display: flex; align-items: center; gap: 6px;
-    backdrop-filter: blur(5px); border: 1px solid rgba(255,255,255,0.1);
-}
-
-/* WELCOME MODAL */
-#welcome-modal {
-    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-    background: rgba(0,0,0,0.85); backdrop-filter: blur(10px);
-    z-index: 9999; display: flex; align-items: center; justify-content: center;
-    pointer-events: auto; /* Ensure clickable */
-}
-.modal-content {
-    background: #333; padding: 30px; border-radius: 20px;
-    text-align: center; border: 1px solid #555; box-shadow: 0 20px 50px rgba(0,0,0,0.5);
-}
-.modal-content h2 { color: white; margin-top: 0; }
-.modal-content input {
-    padding: 10px; border-radius: 8px; border: 1px solid #555;
-    background: #222; color: white; font-size: 16px; margin-bottom: 15px;
-    display: block; width: 200px; text-align: center;
-}
-.modal-content button {
-    width: 100%; background: #0a84ff; color: white; margin-top: 10px;
-}
-
-/* VIDEO LAYER */
-#video-layer {
-    display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-    background: #111; z-index: 80; align-items: center; justify-content: center; flex-direction: column;
-}
-#remote-video { width: 100%; height: 100%; object-fit: contain; }
-.video-header {
-    position: absolute; top: 20px; z-index: 81;
-    background: rgba(0,0,0,0.6); padding: 10px 20px; border-radius: 20px;
-    display: flex; gap: 15px; align-items: center;
-}
-.video-header span { color: white; font-weight: bold; }
-.video-header button { background: #333; color: white; height: 30px; font-size: 12px; }
-
-/* NOTIFICATIONS */
-#notification-area {
-    position: fixed; top: 60px; left: 50%; transform: translateX(-50%);
-    display: flex; flex-direction: column; gap: 10px; z-index: 200;
-    pointer-events: none; width: 300px; align-items: center;
-}
-.toast {
-    background: rgba(40, 40, 40, 0.9); color: white; padding: 10px 20px;
-    border-radius: 30px; font-size: 14px; font-weight: 500;
-    border: 1px solid rgba(255,255,255,0.1);
-    box-shadow: 0 5px 15px rgba(0,0,0,0.3);
-    backdrop-filter: blur(5px);
-    animation: pop-in 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-    transition: opacity 0.5s;
-}
-.toast.join { border-left: 5px solid #30d158; }
-.toast.leave { border-left: 5px solid #ff453a; }
-
-@keyframes pop-in {
-    0% { opacity: 0; transform: scale(0.8) translateY(-20px); }
-    100% { opacity: 1; transform: scale(1) translateY(0); }
-}
-
-/* Dock */
-.dock-container {
-    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
-    display: flex; align-items: center; gap: 8px; padding: 10px 15px;
-    background: rgba(30, 30, 30, 0.95); backdrop-filter: blur(10px);
-    border-radius: 20px; border: 1px solid rgba(255, 255, 255, 0.15);
-    box-shadow: 0 10px 40px rgba(0,0,0,0.6); z-index: 100;
-    max-width: 95vw; overflow-x: auto; 
-    -webkit-overflow-scrolling: touch; scrollbar-width: none;
-}
-.dock-container::-webkit-scrollbar { display: none; }
-.divider { width: 1px; height: 24px; background: rgba(255,255,255,0.2); margin: 0 4px; flex-shrink: 0; }
-
-/* Buttons */
-button {
-    height: 40px; padding: 0 15px; border: none; border-radius: 12px;
-    background: transparent; color: #bbb; font-size: 14px; font-weight: 600;
-    cursor: pointer; transition: all 0.2s; white-space: nowrap; 
-    display: flex; align-items: center; justify-content: center; gap: 8px; flex-shrink: 0;
-}
-button:hover { background: rgba(255,255,255,0.1); color: white; }
-button.active { background: #0a84ff; color: white; }
-#btnSelect.active { background: #e0ac00; color: black; }
-#btnMic { color: #ff453a; }
-#btnMic.active-mic { background-color: #30d158; color: white; box-shadow: 0 0 10px rgba(48, 209, 88, 0.4); }
-#btnMic.muted { background-color: rgba(255, 69, 58, 0.2); color: #ff453a; }
-
-button ion-icon { font-size: 18px; }
-
-/* Color Pickers */
-.color-wrapper {
-    position: relative; width: 30px; height: 30px; border-radius: 50%;
-    overflow: hidden; cursor: pointer; border: 2px solid rgba(255,255,255,0.3); flex-shrink: 0;
-}
-input[type="color"] { position: absolute; top: -50%; left: -50%; width: 200%; height: 200%; border: none; cursor: pointer; }
-
-/* Minimap */
-.minimap-container {
-    position: fixed; bottom: 90px; right: 20px;
-    width: 200px; height: 150px;
-    background: rgba(0, 0, 0, 0.6);
-    border: 1px solid rgba(255,255,255,0.1);
-    border-radius: 12px; backdrop-filter: blur(5px);
-    z-index: 90; pointer-events: none;
-}
-#minimapCanvas { width: 100%; height: 100%; display: block; }
-#zoomDisplay { position: absolute; top: 5px; left: 5px; font-size: 10px; color: rgba(255,255,255,0.5); }
-
-/* Text Input */
-#textInputArea {
-    position: absolute; display: none; background: transparent; 
-    color: white; border: 1px dashed white; font-family: sans-serif; font-size: 20px;
-    padding: 5px; z-index: 150; outline: none; min-width: 50px;
-}
-
-/* Remote Cursors */
-.remote-cursor { position: absolute; pointer-events: none; z-index: 50; transition: top 0.1s linear, left 0.1s linear; }
-.cursor-arrow {
-    width: 0; height: 0; 
-    border-left: 6px solid transparent; border-right: 6px solid transparent;
-    border-bottom: 12px solid currentColor; transform: rotate(-25deg);
-}
-
-@media (max-width: 768px) {
-    .btn-label { display: none; }
-    button { padding: 0 10px; height: 44px; }
-    button ion-icon { font-size: 22px; }
-    .minimap-container { display: none; }
-    .dock-container { bottom: 10px; padding: 8px; width: 90%; justify-content: flex-start; }
-}"
+</html>
