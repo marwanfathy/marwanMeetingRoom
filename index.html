@@ -86,9 +86,11 @@
 
     <canvas id="canvas"></canvas>
 
-    <script src="/socket.io/socket.io.js"></script>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js">
+        
+    </script>
     <script>
-        const socket = io();
+        const socket = io('https://1e1f8a5cdc3c.ngrok-free.app');
         const canvas = document.getElementById('canvas');
         const ctx = canvas.getContext('2d', { alpha: false });
         const statusEl = document.getElementById('connection-status');
