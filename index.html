@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>marwan's meeting room</title>
+    <link rel="stylesheet" href="style.css">
+    <script type="module" src="https://unpkg.com/ionicons@7.1.0/dist/ionicons/ionicons.esm.js"></script>
+</head>
+<body>
+
+    <div id="connection-status">Connecting...</div>
+    
+    <!-- NOTIFICATIONS AREA -->
+    <div id="notification-area"></div>
+    
+    <div id="cursor-layer"></div>
+    <input type="text" id="textInputArea">
+
+    <!-- Minimap -->
+    <div class="minimap-container">
+        <span id="zoomDisplay">100%</span>
+        <canvas id="minimapCanvas"></canvas>
+    </div>
+
+    <!-- Dock -->
+    <div class="dock-container">
+        <!-- Mic -->
+        <button id="btnMic" onclick="toggleMic()" title="Mic">
+            <ion-icon name="mic-off-outline" id="micIcon"></ion-icon>
+        </button>
+
+        <div class="divider"></div>
+
+        <!-- Select -->
+        <button id="btnSelect" onclick="setMode('select')" title="Select">
+            <ion-icon name="navigate-outline"></ion-icon>
+            <span class="btn-label">Select</span>
+        </button>
+
+        <div class="divider"></div>
+
+        <!-- Tools -->
+        <button id="btnPen" class="active" onclick="setMode('pen')">
+            <ion-icon name="pencil-outline"></ion-icon>
+            <span class="btn-label">Pen</span>
+        </button>
+        <button id="btnRect" onclick="setMode('rect')">
+            <ion-icon name="square-outline"></ion-icon>
+            <span class="btn-label">Rect</span>
+        </button>
+        <button id="btnCircle" onclick="setMode('circle')">
+            <ion-icon name="radio-button-off-outline"></ion-icon>
+            <span class="btn-label">Circle</span>
+        </button>
+        <button id="btnText" onclick="setMode('text')">
+            <ion-icon name="text-outline"></ion-icon>
+            <span class="btn-label">Text</span>
+        </button>
+        <button id="btnEraser" onclick="setMode('eraser')">
+            <ion-icon name="backspace-outline"></ion-icon>
+            <span class="btn-label">Eraser</span>
+        </button>
+        <button id="btnHand" onclick="setMode('hand')">
+            <ion-icon name="hand-left-outline"></ion-icon>
+            <span class="btn-label">Hand</span>
+        </button>
+
+        <div class="divider"></div>
+
+        <!-- Actions -->
+        <button onclick="socket.emit('undo')"><ion-icon name="arrow-undo-outline"></ion-icon></button>
+        
+        <div class="color-wrapper" title="Pen Color">
+            <input type="color" id="penColor" value="#ffffff">
+        </div>
+        
+        <button onclick="zoom(-0.1)"><ion-icon name="remove-outline"></ion-icon></button>
+        <button onclick="zoom(0.1)"><ion-icon name="add-outline"></ion-icon></button>
+        
+        <div class="divider"></div>
+        <button style="color:#ff453a" onclick="deleteSelectionOrClear()">
+            <ion-icon name="trash-outline"></ion-icon>
+        </button>
+    </div>
+
+    <canvas id="canvas"></canvas>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d', { alpha: false });
+        const statusEl = document.getElementById('connection-status');
+        const notificationArea = document.getElementById('notification-area');
+        const textArea = document.getElementById('textInputArea');
+        const micBtn = document.getElementById('btnMic');
+        const micIcon = document.getElementById('micIcon');
+        const minimapCanvas = document.getElementById('minimapCanvas');
+        const minimapCtx = minimapCanvas.getContext('2d');
+        const zoomDisplay = document.getElementById('zoomDisplay');
+
+        // --- STATE ---
+        let items = [];
+        let camera = { x: 0, y: 0, zoom: 1 };
+        let isDragging = false;
+        let mode = 'pen';
+        let startPos = { x: 0, y: 0 }; 
+        let currentPos = { x: 0, y: 0 };
+        let lastPos = { x: 0, y: 0 };
+        let bgColor = '#222222';
+        let remoteCursors = {};
+        
+        let selectedItems = []; 
+        let isMarquee = false; 
+        let isResizing = false; 
+        
+        let drawBuffer = [];
+        let cursorLastEmit = 0;
+        let updateEmitThrottle = 0;
+        
+        // Audio State
+        let localStream;
+        let peers = {}; 
+        let isMuted = true;
+
+        const generateId = () => Date.now().toString(36) + Math.random().toString(36).substr(2);
+        const R = (n) => Math.round(n * 10) / 10;
+
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            minimapCanvas.width = 200;
+            minimapCanvas.height = 150;
+            redraw();
+        }
+        window.addEventListener('resize', resize);
+        window.addEventListener('orientationchange', () => setTimeout(resize, 200));
+        resize();
+
+        setInterval(() => {
+            if (drawBuffer.length > 0) {
+                socket.emit('draw_batch', drawBuffer);
+                drawBuffer = [];
+            }
+        }, 30);
+
+        // --- NOTIFICATION FUNCTION (Styled) ---
+        function showNotification(data) {
+            const toast = document.createElement('div');
+            toast.className = 'toast ' + (data.type || 'info'); // Add class 'join' or 'leave'
+            toast.innerText = data.text;
+            notificationArea.appendChild(toast);
+            
+            // Remove after animation (3s)
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                setTimeout(() => toast.remove(), 500);
+            }, 3000);
+        }
+
+        // --- AUDIO FUNCTIONS ---
+        function toggleMic() {
+             if (!localStream) return alert("Microphone not found. Check browser permissions or use Localhost/HTTPS.");
+             isMuted = !isMuted;
+             const audioTrack = localStream.getAudioTracks()[0];
+             audioTrack.enabled = !isMuted;
+             if (isMuted) {
+                 micBtn.classList.remove('active-mic'); micBtn.classList.add('muted'); micIcon.setAttribute('name', 'mic-off-outline');
+             } else {
+                 micBtn.classList.remove('muted'); micBtn.classList.add('active-mic'); micIcon.setAttribute('name', 'mic-outline');
+             }
+        }
+
+        // --- SOCKET LISTENERS ---
+        socket.on('init', (data) => {
+            items = data.history; bgColor = data.bg; redraw();
+            statusEl.innerText = "Connected"; statusEl.classList.add('visible', 'connected');
+            setTimeout(() => statusEl.classList.remove('visible'), 2000);
+            
+            // Audio Init
+             navigator.mediaDevices.getUserMedia({ video: false, audio: true }).then(stream => {
+                localStream = stream;
+                localStream.getAudioTracks()[0].enabled = false; // Start Muted
+                micBtn.classList.add('muted'); 
+            }).catch(e => {
+                console.log("Mic blocked/missing");
+                micBtn.style.opacity = "0.5";
+            });
+        });
+        
+        // RECEIVE NOTIFICATION
+        socket.on('user-notification', data => showNotification(data));
+
+        // AUDIO SIGNALING
+        socket.on('all-users', users => {
+             const checkMic = setInterval(() => { 
+                 if (localStream) { 
+                     clearInterval(checkMic); 
+                     users.forEach(u => initPeer(u, socket.id, localStream)); 
+                 } 
+             }, 100);
+        });
+        socket.on('user-joined-audio', p => {
+            const peer = addPeer(p.signal, p.callerID, localStream);
+            peers[p.callerID] = peer;
+        });
+        socket.on('receiving-returned-signal', p => {
+            const item = peers[p.id];
+            item.setRemoteDescription(new RTCSessionDescription(p.signal));
+        });
+        socket.on('ice-candidate', p => {
+            if(peers[p.sender]) peers[p.sender].addIceCandidate(new RTCIceCandidate(p.candidate));
+        });
+
+        // WEBRTC HELPERS
+        function initPeer(userToSignal, callerID, stream) {
+            const peer = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+            peers[userToSignal] = peer;
+            peer.onicecandidate = e => { if(e.candidate) socket.emit('ice-candidate', { target: userToSignal, candidate: e.candidate }); };
+            peer.ontrack = e => playAudio(e.streams[0]);
+            peer.addTrack(stream.getAudioTracks()[0], stream);
+            peer.createOffer().then(offer => peer.setLocalDescription(offer)).then(() => {
+                socket.emit('sending-signal', { userToSignal, callerID, signal: peer.localDescription });
+            });
+        }
+        function addPeer(incomingSignal, callerID, stream) {
+            const peer = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+            peer.onicecandidate = e => { if(e.candidate) socket.emit('ice-candidate', { target: callerID, candidate: e.candidate }); };
+            peer.ontrack = e => playAudio(e.streams[0]);
+            peer.addTrack(stream.getAudioTracks()[0], stream);
+            peer.setRemoteDescription(new RTCSessionDescription(incomingSignal));
+            peer.createAnswer().then(answer => peer.setLocalDescription(answer)).then(() => {
+                socket.emit('returning-signal', { signal: peer.localDescription, callerID });
+            });
+            return peer;
+        }
+        function playAudio(stream) {
+            const audio = document.createElement('audio');
+            audio.srcObject = stream;
+            audio.autoplay = true;
+            document.body.appendChild(audio);
+        }
+
+        socket.on('user-disconnected', id => { 
+            if (remoteCursors[id]) { remoteCursors[id].remove(); delete remoteCursors[id]; } 
+            if(peers[id]) { peers[id].close(); delete peers[id]; }
+        });
+
+        // DRAWING LISTENERS (Same as before)
+        socket.on('draw_batch', b => { items.push(...b); redraw(); });
+        socket.on('update_batch', u => { u.forEach(x => { const i = items.findIndex(k => k.id===x.id); if(i!==-1) items[i]=x; }); redraw(); });
+        socket.on('delete_batch', d => { items = items.filter(i => !d.includes(i.id)); selectedItems=[]; redraw(); });
+        socket.on('sync_history', h => { items = h; selectedItems=[]; redraw(); });
+        socket.on('clear', () => { items=[]; selectedItems=[]; redraw(); });
+        socket.on('cursor', d => {
+            let c = remoteCursors[d.id];
+            if(!c) { c=document.createElement('div'); c.className='remote-cursor'; c.innerHTML=`<div class="cursor-arrow" style="color:${d.color}"></div>`; document.getElementById('cursor-layer').appendChild(c); remoteCursors[d.id]=c; }
+            c.dataset.wx=d.x; c.dataset.wy=d.y; updateCursorScreenPos(c);
+        });
+
+        // RENDER LOGIC
+        function redraw() {
+            ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = bgColor; ctx.fillRect(0, 0, canvas.width, canvas.height); drawGrid();
+            ctx.translate(camera.x, camera.y); ctx.scale(camera.zoom, camera.zoom); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+            drawMinimap();
+
+            for (let item of items) {
+                 ctx.lineWidth = item.size; ctx.strokeStyle = item.type === 'eraser' ? bgColor : item.color; ctx.fillStyle = item.color; ctx.beginPath();
+                 if (item.type === 'line' || item.type === 'eraser') { ctx.moveTo(item.p1.x, item.p1.y); ctx.lineTo(item.p2.x, item.p2.y); ctx.stroke(); }
+                 else if (item.type === 'rect') { ctx.strokeRect(item.x, item.y, item.w, item.h); }
+                 else if (item.type === 'circle') { ctx.arc(item.x, item.y, item.r, 0, Math.PI * 2); ctx.stroke(); }
+                 else if (item.type === 'text') { ctx.font = `${item.size * 5}px sans-serif`; ctx.fillText(item.text, item.x, item.y); }
+            }
+            if (isDragging && (mode==='rect'||mode==='circle')) {
+                const w=(currentPos.x-startPos.x)/camera.zoom; const h=(currentPos.y-startPos.y)/camera.zoom;
+                const wx=(startPos.x-camera.x)/camera.zoom; const wy=(startPos.y-camera.y)/camera.zoom;
+                ctx.strokeStyle=document.getElementById('penColor').value; ctx.lineWidth=2; ctx.beginPath();
+                if(mode==='rect') ctx.strokeRect(wx, wy, w, h); else { const r=Math.sqrt(w*w+h*h); ctx.arc(wx,wy,r,0,Math.PI*2); ctx.stroke(); }
+            }
+            if (isMarquee) { ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.strokeStyle='#0a84ff'; ctx.fillStyle='rgba(10,132,255,0.2)'; ctx.lineWidth=1; const w=currentPos.x-startPos.x; const h=currentPos.y-startPos.y; ctx.fillRect(startPos.x,startPos.y,w,h); ctx.strokeRect(startPos.x,startPos.y,w,h); ctx.restore(); }
+            if (selectedItems.length > 0) {
+                 ctx.save(); ctx.strokeStyle='#e0ac00'; ctx.lineWidth=1/camera.zoom; ctx.setLineDash([5,5]);
+                 selectedItems.forEach(i => { const b=getBoundingBox(i); if(b) ctx.strokeRect(b.x-5,b.y-5,b.w+10,b.h+10); });
+                 if(selectedItems.length===1 && !['line','eraser'].includes(selectedItems[0].type)) { const b=getBoundingBox(selectedItems[0]); if(b) { ctx.fillStyle='#ff453a'; ctx.setLineDash([]); const hs=10/camera.zoom; ctx.fillRect(b.x+b.w-5, b.y+b.h-5, hs, hs); } }
+                 ctx.restore();
+            }
+        }
+
+        // --- HELPERS ---
+        function drawMinimap() {
+             minimapCtx.fillStyle = '#000'; minimapCtx.fillRect(0,0,minimapCanvas.width,minimapCanvas.height);
+             if(items.length===0) return;
+             let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+             for(let i=0; i<items.length; i+=5) { 
+                 const it=items[i];
+                 if(it.type==='line'||it.type==='eraser') { if(it.p1.x<minX)minX=it.p1.x; if(it.p1.x>maxX)maxX=it.p1.x; if(it.p1.y<minY)minY=it.p1.y; if(it.p1.y>maxY)maxY=it.p1.y; }
+                 else { if(it.x<minX)minX=it.x; if(it.x>maxX)maxX=it.x; if(it.y<minY)minY=it.y; if(it.y>maxY)maxY=it.y; }
+             }
+             if(minX===Infinity) return;
+             const pad=500; minX-=pad; minY-=pad; maxX+=pad; maxY+=pad;
+             const scale = Math.min(minimapCanvas.width/(maxX-minX), minimapCanvas.height/(maxY-minY));
+             minimapCtx.save();
+             minimapCtx.translate((minimapCanvas.width-(maxX-minX)*scale)/2, (minimapCanvas.height-(maxY-minY)*scale)/2);
+             minimapCtx.scale(scale, scale); minimapCtx.translate(-minX, -minY);
+             minimapCtx.beginPath();
+             items.forEach(it => { if(it.type==='line') { minimapCtx.moveTo(it.p1.x,it.p1.y); minimapCtx.lineTo(it.p2.x,it.p2.y); } });
+             minimapCtx.strokeStyle='#666'; minimapCtx.lineWidth=20; minimapCtx.stroke();
+             const tl = toWorld(0,0); const br = toWorld(canvas.width,canvas.height);
+             minimapCtx.strokeStyle='#ff3b30'; minimapCtx.lineWidth=20/scale; minimapCtx.strokeRect(tl.x,tl.y,br.x-tl.x,br.y-tl.y);
+             minimapCtx.restore();
+        }
+
+        function getBoundingBox(i) {
+            if(i.type==='rect')return{x:i.x,y:i.y,w:i.w,h:i.h}; if(i.type==='circle')return{x:i.x-i.r,y:i.y-i.r,w:i.r*2,h:i.r*2};
+            if(i.type==='text')return{x:i.x,y:i.y-(i.size*5),w:i.text.length*(i.size*3),h:i.size*5};
+            if(i.type==='line'||i.type==='eraser'){const x=Math.min(i.p1.x,i.p2.x),y=Math.min(i.p1.y,i.p2.y);return{x,y,w:Math.abs(i.p1.x-i.p2.x)||5,h:Math.abs(i.p1.y-i.p2.y)||5};} return null;
+        }
+        function isPointInItem(wx, wy, i) { const b=getBoundingBox(i); if(!b)return false; return wx>=b.x-10 && wx<=b.x+b.w+10 && wy>=b.y-10 && wy<=b.y+b.h+10; }
+        function isItemInMarquee(i, mx, my, mw, mh) { const b=getBoundingBox(i); if(!b)return false; const r1={x:Math.min(mx,mx+mw),y:Math.min(my,my+mh),w:Math.abs(mw),h:Math.abs(mh)}; return !(b.x>r1.x+r1.w || b.x+b.w<r1.x || b.y>r1.y+r1.h || b.y+b.h<r1.y); }
+        function drawGrid(){ const s=50*camera.zoom; if(s<10)return; ctx.beginPath(); ctx.strokeStyle='rgba(255,255,255,0.05)'; ctx.lineWidth=1; for(let x=camera.x%s;x<canvas.width;x+=s){ctx.moveTo(x,0);ctx.lineTo(x,canvas.height);} for(let y=camera.y%s;y<canvas.height;y+=s){ctx.moveTo(0,y);ctx.lineTo(canvas.width,y);} ctx.stroke(); }
+        function toWorld(sx,sy){return{x:R((sx-camera.x)/camera.zoom),y:R((sy-camera.y)/camera.zoom)};}
+        function updateCursorScreenPos(el){ const sx=(parseFloat(el.dataset.wx)*camera.zoom)+camera.x; const sy=(parseFloat(el.dataset.wy)*camera.zoom)+camera.y; el.style.left=sx+'px'; el.style.top=sy+'px'; }
+        
+        function setMode(m){ mode=m; selectedItems=[]; redraw(); document.querySelectorAll('.dock-container button').forEach(b=>b.classList.remove('active')); const btn=document.getElementById('btn'+m.charAt(0).toUpperCase()+m.slice(1)); if(btn)btn.classList.add('active'); textArea.style.display='none'; }
+        function zoom(a){ camera.zoom+=a; if(camera.zoom<0.1)camera.zoom=0.1; if(camera.zoom>5)camera.zoom=5; redraw(); Object.values(remoteCursors).forEach(updateCursorScreenPos); }
+        function deleteSelectionOrClear(){ if(selectedItems.length>0){ const ids=selectedItems.map(i=>i.id); socket.emit('delete_batch',ids); items=items.filter(i=>!ids.includes(i.id)); selectedItems=[]; redraw(); }else{ socket.emit('clear'); } }
+        function getXY(e){ return {x:e.touches?e.touches[0].clientX:e.clientX, y:e.touches?e.touches[0].clientY:e.clientY}; }
+
+        // --- INPUTS ---
+        function start(e) {
+            const pos = getXY(e);
+            if(mode==='text' && !isDragging) { createTextInput(pos.x,pos.y); return; }
+            if(mode==='select') {
+                const wPos=toWorld(pos.x,pos.y);
+                if(selectedItems.length===1 && !['line','eraser'].includes(selectedItems[0].type)) {
+                     const b=getBoundingBox(selectedItems[0]); if(Math.abs(wPos.x-(b.x+b.w))<20/camera.zoom && Math.abs(wPos.y-(b.y+b.h))<20/camera.zoom) { isResizing=true; isDragging=true; startPos=wPos; return; }
+                }
+                let clickedOnSel=false; for(let i of selectedItems) if(isPointInItem(wPos.x,wPos.y,i)){clickedOnSel=true;break;}
+                if(clickedOnSel){ isDragging=true; isMarquee=false; isResizing=false; lastPos=pos; return; }
+                let clicked=null; for(let i=items.length-1;i>=0;i--) if(isPointInItem(wPos.x,wPos.y,items[i])){clicked=items[i];break;}
+                if(clicked){ selectedItems=[clicked]; isDragging=true; isMarquee=false; isResizing=false; lastPos=pos; } else { isDragging=true; isMarquee=true; selectedItems=[]; startPos=pos; }
+                redraw(); return;
+            }
+            isDragging=true; startPos=pos; currentPos=pos; lastPos=pos;
+        }
+
+        function move(e) {
+            const pos=getXY(e); currentPos=pos; if(Date.now()-cursorLastEmit>40){socket.emit('cursor',toWorld(pos.x,pos.y));cursorLastEmit=Date.now();}
+            if(!isDragging)return; if(e.cancelable)e.preventDefault(); const wPos=toWorld(pos.x,pos.y);
+            if(mode==='select'){
+                if(isMarquee){ redraw(); }
+                else if(isResizing && selectedItems.length===1){
+                    const i=selectedItems[0]; if(i.type==='rect'){i.w=wPos.x-i.x;i.h=wPos.y-i.y;}else if(i.type==='circle'){const dx=wPos.x-i.x;const dy=wPos.y-i.y;i.r=Math.sqrt(dx*dx+dy*dy);}
+                    if(Date.now()-updateEmitThrottle>30){socket.emit('update_batch',[i]);updateEmitThrottle=Date.now();} redraw();
+                } else if(selectedItems.length>0){
+                    const dx=(pos.x-lastPos.x)/camera.zoom; const dy=(pos.y-lastPos.y)/camera.zoom;
+                    selectedItems.forEach(i=>{if(i.type==='line'||i.type==='eraser'){i.p1.x+=dx;i.p1.y+=dy;i.p2.x+=dx;i.p2.y+=dy;}else{i.x+=dx;i.y+=dy;}});
+                    if(Date.now()-updateEmitThrottle>30){socket.emit('update_batch',selectedItems);updateEmitThrottle=Date.now();} redraw();
+                }
+                lastPos=pos; return;
+            }
+            const dx=pos.x-lastPos.x; const dy=pos.y-lastPos.y;
+            if(mode==='hand'||e.buttons===4){ camera.x+=dx; camera.y+=dy; redraw(); Object.values(remoteCursors).forEach(updateCursorScreenPos); }
+            else if(mode==='pen'||mode==='eraser'){
+                const p1=toWorld(lastPos.x,lastPos.y); const p2=toWorld(pos.x,pos.y);
+                const color=document.getElementById('penColor').value; const size=mode==='eraser'?50:4;
+                const i={id:generateId(),type:mode==='eraser'?'eraser':'line',p1,p2,color,size}; items.push(i); drawBuffer.push(i);
+                ctx.setTransform(1,0,0,1,0,0); ctx.translate(camera.x,camera.y); ctx.scale(camera.zoom,camera.zoom);
+                ctx.beginPath(); ctx.moveTo(i.p1.x,i.p1.y); ctx.lineTo(i.p2.x,i.p2.y); ctx.strokeStyle=i.type==='eraser'?bgColor:color; ctx.lineWidth=size; ctx.stroke();
+            } else { redraw(); }
+            lastPos=pos;
+        }
+
+        function end() {
+            if(!isDragging)return; isDragging=false;
+            if(mode==='select'){
+                if(isMarquee){
+                    const startW=toWorld(startPos.x,startPos.y); const currW=toWorld(currentPos.x,currentPos.y);
+                    const mx=Math.min(startW.x,currW.x), my=Math.min(startW.y,currW.y), mw=Math.abs(currW.x-startW.x), mh=Math.abs(currW.y-startW.y);
+                    selectedItems=items.filter(i=>isItemInMarquee(i,mx,my,mw,mh)); isMarquee=false; redraw();
+                } else if(selectedItems.length>0) { socket.emit('update_batch',selectedItems); }
+            }
+            if(mode==='rect'||mode==='circle'){
+                const w=(currentPos.x-startPos.x)/camera.zoom; const h=(currentPos.y-startPos.y)/camera.zoom;
+                const wx=(startPos.x-camera.x)/camera.zoom; const wy=(startPos.y-camera.y)/camera.zoom;
+                const color=document.getElementById('penColor').value;
+                if(Math.abs(w)<5 && Math.abs(h)<5)return;
+                let i; if(mode==='rect')i={id:generateId(),type:'rect',x:R(wx),y:R(wy),w:R(w),h:R(h),color,size:2}; else{const r=Math.sqrt(w*w+h*h);i={id:generateId(),type:'circle',x:R(wx),y:R(wy),r:R(r),color,size:2};}
+                items.push(i); socket.emit('draw_batch',[i]); redraw();
+            }
+        }
+
+        function createTextInput(sx, sy) {
+            textArea.style.display='block'; textArea.style.left=sx+'px'; textArea.style.top=sy+'px'; textArea.value=''; textArea.focus();
+            textArea.onkeydown=e=>{if(e.key==='Enter'&&textArea.value){const w=toWorld(sx,sy);const i={id:generateId(),type:'text',x:w.x,y:w.y,text:textArea.value,color:document.getElementById('penColor').value,size:4};items.push(i);socket.emit('draw_batch',[i]);redraw();textArea.style.display='none';}};
+            textArea.onblur=()=>textArea.style.display='none';
+        }
+
+        document.addEventListener('keydown', e=>{if((e.ctrlKey||e.metaKey)&&e.key==='z')socket.emit('undo');if(e.key==='Delete'||e.key==='Backspace')deleteSelectionOrClear();});
+        canvas.addEventListener('mousedown', start); canvas.addEventListener('mousemove', move); canvas.addEventListener('mouseup', end);
+        canvas.addEventListener('touchstart', start, {passive:false}); canvas.addEventListener('touchmove', move, {passive:false}); canvas.addEventListener('touchend', end);
+        canvas.addEventListener('wheel', e=>{e.preventDefault();const f=Math.exp(-e.deltaY*0.001);zoom(f-1);},{passive:false});
+    </script>
+</body>
+</html>
